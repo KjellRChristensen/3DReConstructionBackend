@@ -92,14 +92,107 @@ dmypy.json
 .AppleDouble
 .LSOverride
 
-# Model weights and large files
+# ==============================================================================
+# ML/AI Large Files - NEVER commit these to remote
+# ==============================================================================
+
+# Model weights (PyTorch, TensorFlow, etc.)
 *.pt
 *.pth
 *.ckpt
 *.safetensors
 *.bin
+*.h5
+*.hdf5
+*.keras
+*.pb
+*.tflite
+*.onnx
+*.mlmodel
+*.mlpackage/
+
+# Model directories
 models/
 weights/
+checkpoints/
+pretrained/
+finetuned/
+
+# Hugging Face cache
+.cache/
+huggingface/
+transformers_cache/
+
+# GGML/GGUF quantized models
+*.ggml
+*.gguf
+
+# Large embeddings and tensors
+*.npy
+*.npz
+embeddings/
+
+# Training artifacts
+runs/
+tensorboard/
+wandb/
+mlruns/
+
+# Dataset files (large)
+*.parquet
+*.arrow
+*.tfrecord
+datasets/
+
+# 3D model files (can be large)
+*.glb
+*.gltf
+*.obj
+*.stl
+*.fbx
+*.usdz
+*.step
+*.stp
+*.iges
+*.igs
+*.3ds
+*.blend
+*.blend1
+
+# Point clouds
+*.pcd
+*.ply
+*.las
+*.laz
+
+# Images (training data)
+*.tif
+*.tiff
+training_images/
+train_data/
+
+# Video files
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Archives (often contain large datasets)
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.rar
+*.7z
+
+# Specific ML framework caches
+torch_extensions/
+__pycache__/
+*.pyc
+
+# LFS placeholder - use Git LFS for any large files that MUST be tracked
+# See: https://git-lfs.github.com/
+*.lfs
 
 # Data directories (keep structure, ignore contents)
 data/input/*
