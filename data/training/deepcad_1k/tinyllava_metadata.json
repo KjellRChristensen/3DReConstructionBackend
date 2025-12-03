@@ -1,0 +1,14 @@
+{
+  "dataset_name": "deepcad_1k",
+  "format": "TinyLLaVA conversation format",
+  "train_samples": 3000,
+  "val_samples": 300,
+  "total_conversations": 3300,
+  "views_per_model": 3,
+  "conversation_templates": 5,
+  "files": {
+    "train": "data/training/deepcad_1k/train.json",
+    "val": "data/training/deepcad_1k/val.json",
+    "images": "data/training/deepcad_1k/images"
+  }
+}

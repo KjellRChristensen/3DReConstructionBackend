@@ -1,0 +1,93 @@
+# Fine-tuning Configuration for VLM CAD Models
+#
+# Usage:
+#   python -m training.finetune --config config/finetune_config.yaml
+#
+# Models available:
+#   - Yuan-Che/OpenECADv2-CLIP-0.55B      (smallest, 2GB VRAM)
+#   - Yuan-Che/OpenECADv2-SigLIP-0.89B    (recommended, 3GB VRAM)
+#   - Yuan-Che/OpenECADv2-SigLIP-2.4B     (better quality, 6GB VRAM)
+#   - Yuan-Che/OpenECAD-SigLIP-3.1B       (best quality, 8GB VRAM)
+
+# ==============================================================================
+# Model Configuration
+# ==============================================================================
+base_model: "Yuan-Che/OpenECADv2-SigLIP-0.89B"
+model_type: "openecad"  # openecad or internvl
+
+# ==============================================================================
+# Data Paths
+# ==============================================================================
+# Generate these using: python -m training.dataset ...
+train_data: "data/training/train/train.json"
+val_data: "data/training/val/val.json"
+image_folder: "data/training/images"
+
+# ==============================================================================
+# Output
+# ==============================================================================
+output_dir: "checkpoints"
+run_name: null  # Auto-generated if null
+
+# ==============================================================================
+# LoRA Configuration (following OpenECAD paper)
+# ==============================================================================
+use_lora: true
+lora:
+  r: 128           # LoRA rank
+  alpha: 256       # LoRA alpha (typically 2x rank)
+  dropout: 0.05    # LoRA dropout
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+  bias: "none"
+  task_type: "CAUSAL_LM"
+
+# ==============================================================================
+# Training Hyperparameters
+# ==============================================================================
+training:
+  num_epochs: 3
+  per_device_batch_size: 2      # Reduce if OOM
+  gradient_accumulation_steps: 2 # Effective batch = batch_size * grad_accum * n_gpus
+  learning_rate: 0.0001          # 1e-4
+  lr_scheduler_type: "cosine"
+  warmup_ratio: 0.03
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+
+  # Precision
+  fp16: true                     # Use FP16 (for CUDA)
+  bf16: false                    # Use BF16 (for A100/H100)
+
+  # Memory optimization
+  gradient_checkpointing: true   # Reduces memory, slower training
+
+  # Data loading
+  dataloader_num_workers: 4
+
+  # Logging & Saving
+  logging_steps: 10
+  save_steps: 500
+  eval_steps: 500
+  save_total_limit: 3            # Keep only N best checkpoints
+
+# ==============================================================================
+# Hardware
+# ==============================================================================
+device: "auto"                   # auto, cuda, mps, cpu
+deepspeed_config: null           # Path to DeepSpeed config (optional)
+
+# ==============================================================================
+# Conversation Mode
+# ==============================================================================
+# Depends on base model:
+#   - phi: for Phi-2 based models
+#   - llama: for LLaMA based models
+#   - gemma: for Gemma based models
+conv_mode: "phi"

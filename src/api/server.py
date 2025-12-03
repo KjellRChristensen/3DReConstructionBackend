@@ -2,7 +2,7 @@
 FastAPI Server - REST API for iOS frontend communication
 """
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Dict, Any
 from enum import Enum
 import uuid
 import asyncio
@@ -10,7 +10,7 @@ from datetime import datetime
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import os
@@ -1157,6 +1157,687 @@ def create_app() -> FastAPI:
         }
 
     # =========================================================================
+    # Dataset Management & Fine-tuning Endpoints
+    # =========================================================================
+
+    @app.get("/training/datasets")
+    async def list_datasets():
+        """
+        List all training datasets.
+
+        Returns:
+            List of datasets with their statistics
+        """
+        datasets_dir = Path("data/training")
+        datasets = []
+
+        if datasets_dir.exists():
+            for dataset_path in datasets_dir.iterdir():
+                if dataset_path.is_dir():
+                    stats_file = dataset_path / "dataset_stats.json"
+                    config_file = dataset_path / "config.json"
+
+                    dataset_info = {
+                        "name": dataset_path.name,
+                        "path": str(dataset_path),
+                        "created": datetime.fromtimestamp(dataset_path.stat().st_mtime).isoformat(),
+                    }
+
+                    if stats_file.exists():
+                        import json
+                        with open(stats_file) as f:
+                            dataset_info["stats"] = json.load(f)
+
+                    datasets.append(dataset_info)
+
+        return {
+            "datasets": datasets,
+            "total": len(datasets),
+        }
+
+    @app.post("/training/datasets/create")
+    async def create_dataset(
+        background_tasks: BackgroundTasks,
+        name: str,
+        source_folder: str = "cad_models",
+        annotations_file: Optional[str] = None,
+        resolution: int = 512,
+        views: str = "front,isometric",
+        train_split: float = 0.9,
+    ):
+        """
+        Create a new training dataset from 3D CAD models.
+
+        This generates:
+        - 2D orthographic views for each model
+        - Training JSON in TinyLLaVA format
+        - Train/validation split
+
+        Args:
+            name: Dataset name
+            source_folder: Subfolder in data/input containing CAD models
+            annotations_file: Optional JSON with CAD code annotations
+            resolution: Image resolution
+            views: Comma-separated views to render
+            train_split: Train/val split ratio (default 0.9)
+
+        Returns:
+            Job ID for tracking progress
+        """
+        source_dir = Path("data/input") / source_folder
+
+        if not source_dir.exists():
+            raise HTTPException(
+                status_code=404,
+                detail=f"Source folder not found: data/input/{source_folder}"
+            )
+
+        # Find model files
+        extensions = [".step", ".stp", ".obj", ".glb", ".stl", ".ifc"]
+        model_files = []
+        for ext in extensions:
+            model_files.extend(source_dir.glob(f"**/*{ext}"))
+            model_files.extend(source_dir.glob(f"**/*{ext.upper()}"))
+
+        if not model_files:
+            raise HTTPException(
+                status_code=400,
+                detail=f"No CAD models found in {source_folder}"
+            )
+
+        # Create job
+        job_id = str(uuid.uuid4())
+        now = datetime.utcnow()
+
+        output_dir = Path("data/training") / name
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        jobs[job_id] = {
+            "job_id": job_id,
+            "status": JobStatus.PENDING,
+            "progress": 0.0,
+            "current_stage": "initializing",
+            "created_at": now,
+            "completed_at": None,
+            "error": None,
+            "output_files": [],
+            "job_type": "dataset_creation",
+            "dataset_name": name,
+            "model_count": len(model_files),
+            "config": {
+                "resolution": resolution,
+                "views": views.split(","),
+                "train_split": train_split,
+            }
+        }
+
+        # Start background processing
+        background_tasks.add_task(
+            process_dataset_creation_job,
+            job_id,
+            model_files,
+            output_dir,
+            annotations_file,
+            resolution,
+            views.split(","),
+            train_split,
+        )
+
+        return {
+            "job_id": job_id,
+            "status": "pending",
+            "dataset_name": name,
+            "model_count": len(model_files),
+            "message": f"Dataset creation started for {len(model_files)} models",
+        }
+
+    @app.post("/training/datasets/{name}/add-annotations")
+    async def add_dataset_annotations(
+        name: str,
+        annotations: List[Dict[str, Any]],
+    ):
+        """
+        Add CAD code annotations to an existing dataset.
+
+        Each annotation should have:
+        - image: filename of the image
+        - cad_code: the CAD code that generates this model
+
+        Args:
+            name: Dataset name
+            annotations: List of {image, cad_code} dicts
+        """
+        dataset_dir = Path("data/training") / name
+
+        if not dataset_dir.exists():
+            raise HTTPException(status_code=404, detail=f"Dataset not found: {name}")
+
+        # Load existing annotations if any
+        annotations_file = dataset_dir / "annotations.json"
+        existing = []
+        if annotations_file.exists():
+            import json
+            with open(annotations_file) as f:
+                existing = json.load(f)
+
+        # Add new annotations
+        existing.extend(annotations)
+
+        # Save
+        import json
+        with open(annotations_file, 'w') as f:
+            json.dump(existing, f, indent=2)
+
+        return {
+            "success": True,
+            "dataset": name,
+            "total_annotations": len(existing),
+            "added": len(annotations),
+        }
+
+    @app.get("/training/datasets/{name}/export")
+    async def export_dataset(
+        name: str,
+        format: str = "tinyllava",
+    ):
+        """
+        Export dataset in specified format.
+
+        Args:
+            name: Dataset name
+            format: Export format (tinyllava, jsonl, csv)
+
+        Returns:
+            Download URL for exported dataset
+        """
+        dataset_dir = Path("data/training") / name
+
+        if not dataset_dir.exists():
+            raise HTTPException(status_code=404, detail=f"Dataset not found: {name}")
+
+        train_json = dataset_dir / "train" / "train.json"
+        if not train_json.exists():
+            raise HTTPException(status_code=400, detail="Dataset not yet generated")
+
+        import json
+
+        with open(train_json) as f:
+            train_data = json.load(f)
+
+        val_json = dataset_dir / "val" / "val.json"
+        val_data = []
+        if val_json.exists():
+            with open(val_json) as f:
+                val_data = json.load(f)
+
+        if format == "tinyllava":
+            # Already in TinyLLaVA format
+            return {
+                "format": "tinyllava",
+                "train_file": f"/files/training/{name}/train/train.json",
+                "val_file": f"/files/training/{name}/val/val.json",
+                "image_folder": f"data/training/{name}/images",
+                "train_samples": len(train_data),
+                "val_samples": len(val_data),
+            }
+
+        elif format == "jsonl":
+            # Convert to JSONL
+            export_path = dataset_dir / f"{name}_export.jsonl"
+            with open(export_path, 'w') as f:
+                for item in train_data + val_data:
+                    f.write(json.dumps(item) + "\n")
+
+            return {
+                "format": "jsonl",
+                "file": f"/files/training/{name}/{name}_export.jsonl",
+                "total_samples": len(train_data) + len(val_data),
+            }
+
+        else:
+            raise HTTPException(status_code=400, detail=f"Unknown format: {format}")
+
+    @app.delete("/training/datasets/{name}")
+    async def delete_dataset(name: str):
+        """Delete a training dataset"""
+        dataset_dir = Path("data/training") / name
+
+        if not dataset_dir.exists():
+            raise HTTPException(status_code=404, detail=f"Dataset not found: {name}")
+
+        import shutil
+        shutil.rmtree(dataset_dir)
+
+        return {"success": True, "deleted": name}
+
+    @app.get("/training/finetune/status")
+    async def finetune_status():
+        """
+        Get fine-tuning infrastructure status.
+
+        Returns:
+            Available dependencies, models, and hardware info
+        """
+        try:
+            from ..training.finetune import FineTuner, FineTuneConfig
+
+            # Check dependencies
+            config = FineTuneConfig(
+                train_data="dummy",
+                image_folder="dummy",
+            )
+            tuner = FineTuner.__new__(FineTuner)
+            tuner.config = config
+            tuner._check_dependencies()
+
+            return {
+                "ready": tuner.has_torch and (tuner.has_tinyllava or tuner.has_peft),
+                "dependencies": {
+                    "torch": tuner.has_torch,
+                    "tinyllava": tuner.has_tinyllava,
+                    "peft": tuner.has_peft,
+                    "deepspeed": tuner.has_deepspeed,
+                },
+                "device": tuner.device,
+                "recommended_setup": {
+                    "tinyllava": "git clone https://github.com/TinyLLaVA/TinyLLaVA_Factory.git && cd TinyLLaVA_Factory && pip install -e .",
+                    "peft": "pip install peft",
+                },
+            }
+        except Exception as e:
+            return {
+                "ready": False,
+                "error": str(e),
+            }
+
+    @app.post("/training/finetune/start")
+    async def start_finetuning(
+        background_tasks: BackgroundTasks,
+        dataset_name: str,
+        base_model: str = "Yuan-Che/OpenECADv2-SigLIP-0.89B",
+        epochs: int = 3,
+        batch_size: int = 2,
+        learning_rate: float = 1e-4,
+        lora_rank: int = 128,
+        run_name: Optional[str] = None,
+    ):
+        """
+        Start fine-tuning a VLM model on a dataset.
+
+        Args:
+            dataset_name: Name of the training dataset
+            base_model: Base model to fine-tune
+            epochs: Number of training epochs
+            batch_size: Batch size per device
+            learning_rate: Learning rate
+            lora_rank: LoRA rank
+            run_name: Optional run name (auto-generated if not provided)
+
+        Returns:
+            Job ID for tracking progress
+        """
+        dataset_dir = Path("data/training") / dataset_name
+        train_json = dataset_dir / "train" / "train.json"
+
+        if not train_json.exists():
+            raise HTTPException(
+                status_code=404,
+                detail=f"Dataset not found or not yet generated: {dataset_name}"
+            )
+
+        # Create job
+        job_id = str(uuid.uuid4())
+        now = datetime.utcnow()
+
+        if not run_name:
+            model_short = base_model.split("/")[-1]
+            run_name = f"{model_short}_{dataset_name}_{now.strftime('%Y%m%d_%H%M%S')}"
+
+        jobs[job_id] = {
+            "job_id": job_id,
+            "status": JobStatus.PENDING,
+            "progress": 0.0,
+            "current_stage": "initializing",
+            "created_at": now,
+            "completed_at": None,
+            "error": None,
+            "output_files": [],
+            "job_type": "finetune",
+            "run_name": run_name,
+            "config": {
+                "dataset": dataset_name,
+                "base_model": base_model,
+                "epochs": epochs,
+                "batch_size": batch_size,
+                "learning_rate": learning_rate,
+                "lora_rank": lora_rank,
+            }
+        }
+
+        # Start background processing
+        background_tasks.add_task(
+            process_finetune_job,
+            job_id,
+            dataset_dir,
+            base_model,
+            epochs,
+            batch_size,
+            learning_rate,
+            lora_rank,
+            run_name,
+        )
+
+        return {
+            "job_id": job_id,
+            "status": "pending",
+            "run_name": run_name,
+            "message": f"Fine-tuning started: {run_name}",
+        }
+
+    @app.get("/training/finetune/checkpoints")
+    async def list_checkpoints():
+        """List all fine-tuned model checkpoints"""
+        checkpoints_dir = Path("checkpoints")
+        checkpoints = []
+
+        if checkpoints_dir.exists():
+            for checkpoint_path in checkpoints_dir.iterdir():
+                if checkpoint_path.is_dir():
+                    config_file = checkpoint_path / "config.yaml"
+
+                    checkpoint_info = {
+                        "name": checkpoint_path.name,
+                        "path": str(checkpoint_path),
+                        "created": datetime.fromtimestamp(
+                            checkpoint_path.stat().st_mtime
+                        ).isoformat(),
+                    }
+
+                    if config_file.exists():
+                        import yaml
+                        with open(config_file) as f:
+                            checkpoint_info["config"] = yaml.safe_load(f)
+
+                    # Check for adapter weights
+                    adapter_path = checkpoint_path / "adapter_model.bin"
+                    checkpoint_info["has_lora_adapter"] = adapter_path.exists()
+
+                    checkpoints.append(checkpoint_info)
+
+        return {
+            "checkpoints": checkpoints,
+            "total": len(checkpoints),
+        }
+
+    # =========================================================================
+    # Frontend-Compatible Training API Aliases & Extensions
+    # =========================================================================
+
+    @app.post("/training/start")
+    async def start_training_alias(
+        background_tasks: BackgroundTasks,
+        dataset_id: str,
+        model_id: str = "openecad-0.89b",
+        config: Optional[Dict[str, Any]] = None,
+    ):
+        """
+        Start training (frontend-compatible endpoint).
+
+        Alias for /training/finetune/start with frontend-compatible parameters.
+        Maps simplified model IDs to full HuggingFace repo names.
+
+        Args:
+            dataset_id: Dataset identifier (e.g., "openecad-10k")
+            model_id: Model identifier (e.g., "openecad-0.89b")
+            config: Training configuration {epochs, batch_size, learning_rate, lora_rank}
+        """
+        # Map frontend model IDs to full HuggingFace repo names
+        model_map = {
+            "openecad-0.55b": "Yuan-Che/OpenECADv2-CLIP-0.55B",
+            "openecad-0.89b": "Yuan-Che/OpenECADv2-SigLIP-0.89B",
+            "openecad-2.4b": "Yuan-Che/OpenECADv2-SigLIP-2.4B",
+            "openecad-3.1b": "Yuan-Che/OpenECAD-SigLIP-3.1B",
+            "internvl2-2b": "OpenGVLab/InternVL2-2B",
+            "internvl2-8b": "OpenGVLab/InternVL2-8B",
+        }
+
+        base_model = model_map.get(model_id, model_id)
+
+        # Extract config parameters
+        cfg = config or {}
+        epochs = cfg.get("epochs", 3)
+        batch_size = cfg.get("batch_size", 2)
+        learning_rate = cfg.get("learning_rate", 1e-4)
+        lora_rank = cfg.get("lora_rank", 128)
+
+        # Call the existing finetune endpoint
+        return await start_finetuning(
+            background_tasks=background_tasks,
+            dataset_name=dataset_id,
+            base_model=base_model,
+            epochs=epochs,
+            batch_size=batch_size,
+            learning_rate=learning_rate,
+            lora_rank=lora_rank,
+        )
+
+    @app.get("/training/jobs")
+    async def list_training_jobs(limit: int = 50):
+        """
+        List training jobs (frontend-compatible endpoint).
+
+        Returns only jobs with job_type='finetune', 'dataset_creation', or 'batch_training'.
+        """
+        training_job_types = {"finetune", "dataset_creation", "batch_training"}
+
+        training_jobs = [
+            job for job in jobs.values()
+            if job.get("job_type") in training_job_types
+        ]
+
+        sorted_jobs = sorted(
+            training_jobs,
+            key=lambda j: j["created_at"],
+            reverse=True
+        )[:limit]
+
+        return {
+            "jobs": [JobResponse(**j) for j in sorted_jobs],
+            "total": len(sorted_jobs),
+        }
+
+    @app.get("/training/models")
+    async def list_trained_models():
+        """
+        List trained models (frontend-compatible endpoint).
+
+        Alias for /training/finetune/checkpoints with frontend-compatible response format.
+        """
+        result = await list_checkpoints()
+
+        # Transform to frontend format
+        models = []
+        for checkpoint in result.get("checkpoints", []):
+            model_info = {
+                "id": checkpoint["name"],
+                "name": checkpoint["name"],
+                "path": checkpoint["path"],
+                "created": checkpoint["created"],
+                "has_lora_adapter": checkpoint.get("has_lora_adapter", False),
+            }
+
+            # Add config info if available
+            if "config" in checkpoint:
+                cfg = checkpoint["config"]
+                model_info["base_model"] = cfg.get("base_model", "unknown")
+                model_info["config"] = cfg
+
+            models.append(model_info)
+
+        return {
+            "models": models,
+            "total": len(models),
+        }
+
+    @app.post("/training/datasets/{dataset_id}/download")
+    async def download_dataset(
+        dataset_id: str,
+        background_tasks: BackgroundTasks,
+        subset: Optional[int] = None,
+    ):
+        """
+        Download a training dataset from HuggingFace.
+
+        Args:
+            dataset_id: Dataset identifier ("openecad-919k", "deepcad-178k", "text2cad", etc.)
+            subset: Optional number of samples to download (for testing)
+
+        Returns:
+            Job ID for tracking download progress
+        """
+        # Map dataset IDs to HuggingFace repos or download sources
+        dataset_map = {
+            "openecad-919k": {
+                "source": "huggingface",
+                "repo": "Yuan-Che/OpenECAD-Dataset",
+                "name": "OpenECAD Full Dataset",
+            },
+            "openecad-100k": {
+                "source": "huggingface",
+                "repo": "Yuan-Che/OpenECAD-Dataset",
+                "name": "OpenECAD 100K Subset",
+                "subset_size": 100000,
+            },
+            "openecad-10k": {
+                "source": "huggingface",
+                "repo": "Yuan-Che/OpenECAD-Dataset",
+                "name": "OpenECAD 10K Subset",
+                "subset_size": 10000,
+            },
+            "text2cad": {
+                "source": "huggingface",
+                "repo": "SadilKhan/Text2CAD",
+                "name": "Text2CAD Dataset",
+            },
+        }
+
+        if dataset_id not in dataset_map:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown dataset: {dataset_id}. Available: {list(dataset_map.keys())}"
+            )
+
+        dataset_info = dataset_map[dataset_id]
+
+        # Create job
+        job_id = str(uuid.uuid4())
+        now = datetime.utcnow()
+
+        # Use predefined subset or custom subset
+        download_subset = subset or dataset_info.get("subset_size")
+
+        jobs[job_id] = {
+            "job_id": job_id,
+            "status": JobStatus.PENDING,
+            "progress": 0.0,
+            "current_stage": "initializing",
+            "created_at": now,
+            "completed_at": None,
+            "error": None,
+            "output_files": [],
+            "job_type": "dataset_download",
+            "dataset_id": dataset_id,
+            "dataset_name": dataset_info["name"],
+            "source": dataset_info["source"],
+            "repo": dataset_info["repo"],
+            "subset": download_subset,
+        }
+
+        # Start background download
+        background_tasks.add_task(process_dataset_download_job, job_id)
+
+        return {
+            "job_id": job_id,
+            "status": "pending",
+            "dataset_id": dataset_id,
+            "dataset_name": dataset_info["name"],
+            "message": f"Downloading {dataset_info['name']}",
+        }
+
+    @app.post("/training/jobs/{job_id}/stop")
+    async def stop_training_job(job_id: str):
+        """
+        Stop a running training job.
+
+        Args:
+            job_id: Job ID to stop
+
+        Returns:
+            Success status
+        """
+        if job_id not in jobs:
+            raise HTTPException(status_code=404, detail="Job not found")
+
+        job = jobs[job_id]
+
+        if job["status"] not in [JobStatus.PENDING, JobStatus.PROCESSING]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot stop job with status: {job['status']}"
+            )
+
+        # Signal training process to stop
+        job["status"] = JobStatus.FAILED
+        job["current_stage"] = "Stopping training..."
+        job["error"] = "Training stopped by user"
+        job["completed_at"] = datetime.utcnow()
+
+        # TODO: Implement actual process termination for training jobs
+        # This would require tracking subprocess PIDs or using a more sophisticated
+        # job management system
+
+        return {
+            "success": True,
+            "job_id": job_id,
+            "message": "Training stop requested",
+            "status": job["status"],
+        }
+
+    @app.delete("/training/models/{model_id}")
+    async def delete_trained_model(model_id: str):
+        """
+        Delete a trained model checkpoint.
+
+        Args:
+            model_id: Model/checkpoint ID or name to delete
+
+        Returns:
+            Success status
+        """
+        checkpoints_dir = Path("checkpoints")
+
+        # Find checkpoint by ID or name
+        model_path = None
+        for checkpoint in checkpoints_dir.glob("*"):
+            if checkpoint.is_dir() and (model_id in checkpoint.name or checkpoint.name == model_id):
+                model_path = checkpoint
+                break
+
+        if not model_path:
+            raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
+
+        # Delete checkpoint directory
+        import shutil
+        shutil.rmtree(model_path)
+
+        return {
+            "success": True,
+            "model_id": model_id,
+            "message": f"Model {model_id} deleted",
+            "deleted_path": str(model_path),
+        }
+
+    # =========================================================================
     # VLM CAD Strategy Endpoints
     # =========================================================================
 
@@ -1645,6 +2326,274 @@ async def process_reconstruction_job(job_id: str):
             job["status"] = JobStatus.FAILED
             job["error"] = result.error
             job["current_stage"] = "failed"
+
+    except Exception as e:
+        import traceback
+        job["status"] = JobStatus.FAILED
+        job["error"] = f"{str(e)}\n{traceback.format_exc()}"
+        job["current_stage"] = "failed"
+
+
+async def process_dataset_creation_job(
+    job_id: str,
+    model_files: list,
+    output_dir: Path,
+    annotations_file: Optional[str],
+    resolution: int,
+    views: List[str],
+    train_split: float,
+):
+    """Background task to create training dataset from CAD models"""
+    job = jobs[job_id]
+
+    try:
+        job["status"] = JobStatus.PROCESSING
+        job["current_stage"] = "initializing"
+        job["progress"] = 0.0
+
+        from ..training.dataset import DatasetGenerator, DatasetConfig, CADCodeFormat
+
+        # Load annotations if provided
+        code_map = {}
+        if annotations_file:
+            annotations_path = Path("data/input") / annotations_file
+            if annotations_path.exists():
+                import json
+                with open(annotations_path) as f:
+                    annotations = json.load(f)
+                code_map = {
+                    Path(a.get("model", a.get("path", ""))).stem: a.get("cad_code", a.get("code"))
+                    for a in annotations
+                }
+
+        def code_provider(model_path: Path) -> Optional[str]:
+            return code_map.get(model_path.stem)
+
+        # Create config
+        config = DatasetConfig(
+            output_dir=output_dir,
+            image_resolution=resolution,
+            views=views,
+            code_format=CADCodeFormat.OPENECAD,
+            train_split=train_split,
+        )
+
+        generator = DatasetGenerator(config)
+
+        # Progress callback
+        def progress_callback(current: int, total: int):
+            job["progress"] = current / total if total > 0 else 0
+            job["current_stage"] = f"Processing model {current + 1}/{total}"
+
+        # Generate dataset
+        job["current_stage"] = "generating_dataset"
+        stats = generator.generate_from_models(
+            model_paths=model_files,
+            code_provider=code_provider if code_map else None,
+            progress_callback=progress_callback,
+        )
+
+        # Save config
+        import json
+        config_path = output_dir / "config.json"
+        with open(config_path, 'w') as f:
+            json.dump({
+                "resolution": resolution,
+                "views": views,
+                "train_split": train_split,
+                "model_count": len(model_files),
+            }, f, indent=2)
+
+        job["status"] = JobStatus.COMPLETED
+        job["progress"] = 1.0
+        job["current_stage"] = "complete"
+        job["completed_at"] = datetime.utcnow()
+        job["dataset_stats"] = stats
+        job["output_files"] = [
+            str(output_dir / "train" / "train.json"),
+            str(output_dir / "val" / "val.json"),
+        ]
+
+    except Exception as e:
+        import traceback
+        job["status"] = JobStatus.FAILED
+        job["error"] = f"{str(e)}\n{traceback.format_exc()}"
+        job["current_stage"] = "failed"
+
+
+async def process_finetune_job(
+    job_id: str,
+    dataset_dir: Path,
+    base_model: str,
+    epochs: int,
+    batch_size: int,
+    learning_rate: float,
+    lora_rank: int,
+    run_name: str,
+):
+    """Background task to run model fine-tuning"""
+    job = jobs[job_id]
+
+    try:
+        job["status"] = JobStatus.PROCESSING
+        job["current_stage"] = "initializing"
+        job["progress"] = 0.0
+
+        from ..training.finetune import FineTuner, FineTuneConfig, LoRAConfig, TrainingConfig
+
+        # Create config
+        train_json = dataset_dir / "train" / "train.json"
+        val_json = dataset_dir / "val" / "val.json"
+        image_folder = dataset_dir / "images"
+
+        # Check if images exist in split directories
+        if not image_folder.exists():
+            image_folder = dataset_dir / "train" / "images"
+
+        config = FineTuneConfig(
+            base_model=base_model,
+            train_data=str(train_json),
+            val_data=str(val_json) if val_json.exists() else None,
+            image_folder=str(image_folder),
+            output_dir="checkpoints",
+            run_name=run_name,
+            lora=LoRAConfig(r=lora_rank, alpha=lora_rank * 2),
+            training=TrainingConfig(
+                num_epochs=epochs,
+                per_device_batch_size=batch_size,
+                learning_rate=learning_rate,
+            ),
+        )
+
+        tuner = FineTuner(config)
+
+        # Progress callback
+        def training_callback(epoch: int, step: int, loss: float, total_steps: int):
+            progress = step / total_steps if total_steps > 0 else 0
+            job["progress"] = progress
+            job["current_stage"] = f"Epoch {epoch + 1}/{epochs}, Step {step}, Loss: {loss:.4f}"
+            job["metrics"] = {
+                "epoch": epoch,
+                "step": step,
+                "loss": loss,
+            }
+
+        job["current_stage"] = "loading_model"
+        job["progress"] = 0.05
+
+        # Run training
+        job["current_stage"] = "training"
+        result = tuner.train(progress_callback=training_callback)
+
+        if result.get("success", False):
+            job["status"] = JobStatus.COMPLETED
+            job["progress"] = 1.0
+            job["current_stage"] = "complete"
+            job["completed_at"] = datetime.utcnow()
+            job["training_result"] = result
+            job["output_files"] = [result.get("checkpoint_path", "")]
+        else:
+            job["status"] = JobStatus.FAILED
+            job["error"] = result.get("error", "Unknown training error")
+            job["current_stage"] = "failed"
+
+    except Exception as e:
+        import traceback
+        job["status"] = JobStatus.FAILED
+        job["error"] = f"{str(e)}\n{traceback.format_exc()}"
+        job["current_stage"] = "failed"
+
+
+async def process_dataset_download_job(job_id: str):
+    """Background task to download a training dataset"""
+    job = jobs[job_id]
+
+    try:
+        job["status"] = JobStatus.PROCESSING
+        job["current_stage"] = "downloading"
+        job["progress"] = 0.1
+
+        dataset_id = job["dataset_id"]
+        repo = job["repo"]
+        subset = job.get("subset")
+
+        # Output directory
+        output_name = f"{dataset_id}_{'subset' if subset else 'full'}"
+        output_dir = Path("data/training") / output_name
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        job["current_stage"] = f"Downloading from {repo}"
+        job["progress"] = 0.2
+
+        # Download dataset using HuggingFace datasets library
+        from datasets import load_dataset
+        import json
+
+        if subset:
+            dataset = load_dataset(repo, split=f"train[:{subset}]")
+        else:
+            dataset = load_dataset(repo, split="train")
+
+        job["current_stage"] = "Processing dataset"
+        job["progress"] = 0.6
+
+        # NOTE: The OpenECAD dataset on HuggingFace only contains metadata
+        # (filenames and conversations), not actual images. We'll save the
+        # metadata and document this limitation.
+
+        # Create directory structure
+        train_dir = output_dir / "train"
+        val_dir = output_dir / "val"
+        train_dir.mkdir(parents=True, exist_ok=True)
+        val_dir.mkdir(parents=True, exist_ok=True)
+
+        # Split dataset (90/10 train/val)
+        total_samples = len(dataset)
+        split_idx = int(total_samples * 0.9)
+
+        job["current_stage"] = "Saving train split"
+        job["progress"] = 0.7
+
+        # Save train split
+        train_samples = [dataset[i] for i in range(split_idx)]
+        train_json_path = train_dir / "train.json"
+        with open(train_json_path, 'w') as f:
+            json.dump(train_samples, f, indent=2)
+
+        job["current_stage"] = "Saving validation split"
+        job["progress"] = 0.85
+
+        # Save val split
+        val_samples = [dataset[i] for i in range(split_idx, total_samples)]
+        val_json_path = val_dir / "val.json"
+        with open(val_json_path, 'w') as f:
+            json.dump(val_samples, f, indent=2)
+
+        # Save dataset info
+        info = {
+            "dataset_id": dataset_id,
+            "source_repo": repo,
+            "total_samples": total_samples,
+            "train_samples": len(train_samples),
+            "val_samples": len(val_samples),
+            "downloaded_at": datetime.utcnow().isoformat(),
+            "note": "OpenECAD HF dataset contains metadata only (no images). Images must be obtained separately.",
+        }
+
+        info_path = output_dir / "dataset_info.json"
+        with open(info_path, 'w') as f:
+            json.dump(info, f, indent=2)
+
+        job["status"] = JobStatus.COMPLETED
+        job["progress"] = 1.0
+        job["current_stage"] = "complete"
+        job["completed_at"] = datetime.utcnow()
+        job["output_files"] = [
+            str(train_json_path),
+            str(val_json_path),
+            str(info_path),
+        ]
+        job["dataset_info"] = info
 
     except Exception as e:
         import traceback

@@ -1,0 +1,12 @@
+{
+  "total_models": 1100,
+  "successful": 1100,
+  "failed": 0,
+  "views": [
+    "front",
+    "top",
+    "right"
+  ],
+  "resolution": 512,
+  "output_dir": "data/training/deepcad_1k/images"
+}

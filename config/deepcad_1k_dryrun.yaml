@@ -1,0 +1,66 @@
+# Dry Run Configuration for DeepCAD 1K Dataset
+# Quick test to verify training pipeline works
+
+# Model Configuration
+base_model: "Yuan-Che/OpenECADv2-SigLIP-0.89B"
+model_type: "openecad"
+
+# Data Paths
+train_data: "data/training/deepcad_1k/train.json"
+val_data: "data/training/deepcad_1k/val.json"
+image_folder: "data/training/deepcad_1k/images"
+
+# Output
+output_dir: "checkpoints/deepcad_1k_dryrun"
+run_name: "deepcad_1k_dryrun_test"
+
+# LoRA Configuration
+use_lora: true
+lora:
+  r: 128
+  alpha: 256
+  dropout: 0.05
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+  bias: "none"
+  task_type: "CAUSAL_LM"
+
+# Training Hyperparameters (Dry Run - Minimal)
+training:
+  num_epochs: 1              # Just 1 epoch for dry run
+  per_device_batch_size: 1   # Small batch for quick test
+  gradient_accumulation_steps: 1
+  learning_rate: 0.0001
+  lr_scheduler_type: "cosine"
+  warmup_ratio: 0.03
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+
+  # Precision
+  fp16: false               # Disable for compatibility
+  bf16: false
+
+  # Memory optimization
+  gradient_checkpointing: false  # Disable for speed
+
+  # Data loading
+  dataloader_num_workers: 0  # Single worker for dry run
+
+  # Logging & Saving
+  logging_steps: 1          # Log every step
+  save_steps: 1000000       # Don't save during dry run
+  eval_steps: 1000000       # Don't evaluate during dry run
+  save_total_limit: 1
+
+  # Limit training steps for quick test
+  max_steps: 5              # Only 5 steps for dry run
+
+# Device
+device: "auto"
+conv_mode: "phi"
