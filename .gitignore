@@ -197,8 +197,16 @@ __pycache__/
 # Data directories (keep structure, ignore contents)
 data/input/*
 data/output/*
+data/training/*
 !data/input/.gitkeep
 !data/output/.gitkeep
+!data/training/.gitkeep
+
+# Allow small metadata files in training directories
+!data/training/*/dataset_info.json
+!data/training/*/train_val_split.json
+!data/training/*/rendering_metadata.json
+!data/training/*/tinyllava_metadata.json
 
 # Logs
 *.log

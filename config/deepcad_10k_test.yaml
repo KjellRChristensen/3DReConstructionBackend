@@ -1,0 +1,67 @@
+# Test Configuration for DeepCAD 10K Dataset
+# Full validation test with real metrics
+
+# Model Configuration
+base_model: "Yuan-Che/OpenECADv2-SigLIP-0.89B"
+model_type: "openecad"
+
+# Data Paths
+train_data: "data/training/deepcad_10k/train.json"
+val_data: "data/training/deepcad_10k/val.json"
+image_folder: "data/training/deepcad_10k/images"
+
+# Output
+output_dir: "checkpoints/deepcad_10k_test"
+run_name: "deepcad_10k_validation_test"
+
+# LoRA Configuration
+use_lora: true
+lora:
+  r: 128
+  alpha: 256
+  dropout: 0.05
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+  bias: "none"
+  task_type: "CAUSAL_LM"
+
+# Training Hyperparameters (Test - Minimal subset)
+training:
+  num_epochs: 3              # 3 epochs for proper convergence test
+  per_device_batch_size: 2   # Small batch for testing
+  gradient_accumulation_steps: 2
+  learning_rate: 0.0001
+  lr_scheduler_type: "cosine"
+  warmup_ratio: 0.03
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+
+  # Precision
+  fp16: false               # Disable for compatibility
+  bf16: false
+
+  # Memory optimization
+  gradient_checkpointing: false
+
+  # Data loading
+  dataloader_num_workers: 0
+
+  # Logging & Saving
+  logging_steps: 10
+  save_steps: 1000000       # Don't save during test
+  eval_steps: 50            # Evaluate periodically
+  save_total_limit: 1
+
+  # Limit training steps for quick test (use small subset)
+  max_train_samples: 100    # Only 100 samples for test
+  max_val_samples: 20       # 20 validation samples
+
+# Device
+device: "auto"
+conv_mode: "phi"
