@@ -5,6 +5,109 @@ All notable changes to the 3D Reconstruction Backend will be documented in this 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.4] - 2025-12-04
+
+### 🐛 Critical Bug Fix: MPS/Metal Crash on macOS 26 (Tahoe)
+
+This release addresses a critical crash in PyTorch's MPS (Metal Performance Shaders) backend
+when running on macOS 26 (Tahoe) with Python 3.13.
+
+#### The Problem
+
+PyTorch 2.9.1's MPS backend crashes with Metal heap allocator assertions on macOS 26:
+```
+Exception Type: EXC_CRASH (SIGABRT)
+MTLDebugHeap setPurgeableState: assertion failure
+at::mps::HeapAllocator::MPSHeapAllocatorImpl::release_buffer
+```
+
+This occurs during tensor operations (linear layers, tensor addition) and cannot be prevented
+via environment variables on macOS 26 due to system-level Metal API changes.
+
+#### The Solution
+
+- **Automatic macOS version detection**: Training now detects macOS 26+ and automatically
+  falls back to CPU mode
+- **MPS stability check function**: `check_mps_stability()` tests MPS before use
+- **Graceful fallback**: If MPS crashes during training, automatically recovers on CPU
+- **MPS memory management**: Periodic cache clearing to prevent memory buildup
+- **Wrapper script**: `scripts/run_training.sh` sets Metal environment variables before Python starts
+
+### 🆕 Added
+
+**New Files**:
+- `scripts/run_training.sh` - Wrapper script that sets Metal/MPS environment variables
+- `scripts/test_mps_stability.py` - Test script to verify MPS stability on the system
+- `src/training/trainer.py` - VLM trainer with MPS crash recovery
+- `src/training/worker.py` - Background training worker
+- `src/training/download_tracker.py` - Model download progress tracking
+- `src/training/utils.py` - Training utility functions
+- `src/database/` - SQLAlchemy database models for training jobs
+- `scripts/populate_models.py` - Populate models database
+- `scripts/sync_datasets_to_db.py` - Sync datasets to database
+- `CLAUDE.md` - Claude Code instructions for this project
+
+**New Functions**:
+- `check_mps_stability()` in trainer.py, finetune.py, minimal_training_test.py
+- `MPSMemoryCallback` - Clears MPS cache every 50 steps during training
+- Automatic CPU fallback on MPS crash with training continuation
+
+### 🔧 Changed
+
+**trainer.py**:
+- Added macOS 26+ detection with automatic CPU fallback
+- Added MPS stability check before training
+- Added periodic MPS cache clearing
+- Added crash recovery that switches to CPU if MPS fails mid-training
+
+**finetune.py**:
+- Added MPS stability check with macOS version detection
+- Environment variables for MPS memory management
+
+**minimal_training_test.py**:
+- Added MPS stability check
+- Environment variables for Metal debug layers
+
+### ⚠️ Known Issues
+
+- **macOS 26 (Tahoe)**: MPS is disabled due to PyTorch/Metal incompatibility
+- Training uses CPU on macOS 26, which is slower but stable
+- Waiting for PyTorch to release a compatible update
+
+### 🔮 Workarounds
+
+If you need MPS acceleration:
+1. **Wait for PyTorch fix** - Monitor PyTorch releases for macOS 26 support
+2. **Try PyTorch nightly**: `pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cpu`
+3. **Downgrade to macOS 15 (Sequoia)** - MPS works correctly on macOS 15
+
+### 📊 Performance Impact
+
+| Configuration | Device | Training Speed |
+|--------------|--------|----------------|
+| macOS 15 + PyTorch 2.9.1 | MPS | ~22 samples/sec |
+| macOS 26 + PyTorch 2.9.1 | CPU (fallback) | ~8-12 samples/sec |
+| macOS 26 + PyTorch nightly | MPS (if fixed) | TBD |
+
+### 📦 Technical Details
+
+**Environment Variables** (set before Python starts):
+```bash
+export MTL_DEBUG_LAYER=0
+export MTL_SHADER_VALIDATION=0
+export PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0
+export PYTORCH_ENABLE_MPS_FALLBACK=1
+```
+
+**Usage**:
+```bash
+# Use wrapper script for training (sets env vars before Python)
+./scripts/run_training.sh scripts/test_mps_stability.py
+./scripts/run_training.sh main.py server --port 7001
+```
+
+---
+
 ## [1.0.2] - 2025-12-03
 
 ### 🚀 Major Features

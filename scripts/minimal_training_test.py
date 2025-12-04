@@ -16,6 +16,7 @@ Usage:
 import argparse
 import json
 import sys
+import os
 from pathlib import Path
 import logging
 import time
@@ -25,8 +26,63 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 
+# MPS (Metal Performance Shaders) stability settings for macOS
+# These help prevent crashes on newer macOS versions (26+/Tahoe)
+os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+os.environ["MTL_DEBUG_LAYER"] = "0"
+os.environ["MTL_SHADER_VALIDATION"] = "0"
+
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
+
+
+def check_mps_stability() -> bool:
+    """Test if MPS is stable on this system."""
+    if not (hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()):
+        return False
+
+    # Check macOS version - MPS is unstable on macOS 26+ (Tahoe)
+    import platform
+    try:
+        macos_version = platform.mac_ver()[0]
+        major_version = int(macos_version.split('.')[0])
+        if major_version >= 26:
+            logger.warning(f"macOS {macos_version} detected. MPS unstable on macOS 26+.")
+            return False
+    except (ValueError, IndexError):
+        pass
+
+    try:
+        logger.info("Testing MPS stability...")
+        device = torch.device("mps")
+
+        # Test basic operations
+        x = torch.randn(64, 64, device=device)
+        y = torch.randn(64, 64, device=device)
+        z = torch.matmul(x, y)
+
+        # Test linear layer
+        linear = torch.nn.Linear(64, 64).to(device)
+        output = linear(torch.randn(4, 64, device=device))
+
+        # Test memory management
+        torch.mps.synchronize()
+        torch.mps.empty_cache()
+
+        del x, y, z, linear, output
+        torch.mps.empty_cache()
+
+        logger.info("MPS stability check passed")
+        return True
+
+    except Exception as e:
+        logger.warning(f"MPS stability check failed: {e}")
+        try:
+            torch.mps.empty_cache()
+        except Exception:
+            pass
+        return False
 
 
 class TinyCADDataset(Dataset):
@@ -260,13 +316,18 @@ def main():
     logger.info("Minimal Training Test - Real Metrics")
     logger.info("=" * 60)
 
-    # Check device
+    # Check device - with MPS stability check for macOS 26+
     if torch.cuda.is_available():
         device = torch.device("cuda")
         logger.info(f"✓ Using CUDA: {torch.cuda.get_device_name(0)}")
     elif torch.backends.mps.is_available():
-        device = torch.device("mps")
-        logger.info(f"✓ Using MPS (Apple Silicon)")
+        # MPS available but may be unstable on newer macOS
+        if check_mps_stability():
+            device = torch.device("mps")
+            logger.info(f"✓ Using MPS (Apple Silicon)")
+        else:
+            device = torch.device("cpu")
+            logger.info(f"⚠ MPS unstable, falling back to CPU")
     else:
         device = torch.device("cpu")
         logger.info(f"✓ Using CPU")

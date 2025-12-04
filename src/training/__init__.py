@@ -46,6 +46,10 @@ from .finetune import (
     create_default_config,
 )
 
+from .worker import TrainingWorker
+from .trainer import VLMTrainer
+from .utils import is_model_cached, get_model_cache_info, format_bytes
+
 __all__ = [
     # Orthographic rendering
     "OrthographicRenderer",
@@ -68,4 +72,13 @@ __all__ = [
     "LoRAConfig",
     "TrainingConfig",
     "create_default_config",
+
+    # Training worker
+    "TrainingWorker",
+    "VLMTrainer",
+
+    # Utilities
+    "is_model_cached",
+    "get_model_cache_info",
+    "format_bytes",
 ]

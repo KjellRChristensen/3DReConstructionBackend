@@ -54,17 +54,23 @@ pip install -r requirements.txt
 ### Run Development Server
 
 ```bash
-# Start FastAPI server
-uvicorn src.main:app --reload --host 0.0.0.0 --port 8000
+# Start FastAPI server (recommended - includes startup logging)
+python3 main.py server --reload
+
+# Or specify custom host/port
+python3 main.py server --host 0.0.0.0 --port 7001 --reload
+
+# Alternative: Direct uvicorn (not recommended)
+# uvicorn src.api.server:app --reload --host 0.0.0.0 --port 7001
 ```
 
-The API will be available at `http://localhost:8000`
+The API will be available at `http://localhost:7001`
 
 ### API Documentation
 
 Interactive API documentation is available at:
-- Swagger UI: `http://localhost:8000/docs`
-- ReDoc: `http://localhost:8000/redoc`
+- Swagger UI: `http://localhost:7001/docs`
+- ReDoc: `http://localhost:7001/redoc`
 
 ## Training Pipeline
 
@@ -181,6 +187,7 @@ git push origin v1.0.3
 - **v1.0.1** - Added rendering and dataset management
 - **v1.0.2** - 1K and 10K dataset support with training tests
 - **v1.0.3** - 100K dataset support with complete pipeline validation
+- **v1.1.4** - Critical fix for MPS/Metal crash on macOS 26 (Tahoe)
 
 ## Technical Stack
 
@@ -188,7 +195,7 @@ git push origin v1.0.3
 - **ML/AI**: PyTorch, Transformers, LoRA
 - **CAD Processing**: OCP (Open Cascade), ifcopenshell, trimesh
 - **Rendering**: Matplotlib, PIL
-- **Device Support**: CUDA, MPS (Apple Silicon), CPU
+- **Device Support**: CUDA, MPS (Apple Silicon - macOS 15 and earlier), CPU
 
 ## Requirements
 
@@ -218,7 +225,18 @@ git push origin v1.0.3
 
 [Your Contact Information]
 
+## macOS 26 (Tahoe) Compatibility
+
+⚠️ **Known Issue**: PyTorch's MPS backend crashes on macOS 26 due to Metal API changes.
+
+The training pipeline automatically detects macOS 26+ and falls back to CPU mode.
+For GPU acceleration, use:
+- macOS 15 (Sequoia) or earlier with MPS
+- NVIDIA GPU with CUDA
+
+See `CHANGELOG.md` for details and workarounds.
+
 ---
 
-**Last Updated**: December 3, 2025
-**Version**: v1.0.3
+**Last Updated**: December 4, 2025
+**Version**: v1.1.4

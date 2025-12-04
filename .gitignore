@@ -194,6 +194,14 @@ __pycache__/
 # See: https://git-lfs.github.com/
 *.lfs
 
+# SQLite database
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+data/*.db
+data/*.db-*
+
 # Data directories (keep structure, ignore contents)
 data/input/*
 data/output/*

@@ -3,6 +3,7 @@
 """
 import argparse
 import sys
+import socket
 from pathlib import Path
 
 import uvicorn
@@ -10,9 +11,36 @@ import uvicorn
 
 def run_server(host: str = "0.0.0.0", port: int = 7001, reload: bool = False):
     """Run the API server"""
+    # Get local IP address
+    local_ip = "localhost"
+    if host == "0.0.0.0":
+        try:
+            # Get actual local IP for display
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+            s.close()
+        except Exception:
+            local_ip = "127.0.0.1"
+    else:
+        local_ip = host
+
+    print("\n" + "="*70)
+    print("  3D Reconstruction Backend Server")
+    print("="*70)
+    print(f"  🚀 Server starting...")
+    print(f"  📡 Host: {host}")
+    print(f"  🔌 Port: {port}")
+    print(f"  🌐 Local URL: http://{local_ip}:{port}")
+    print(f"  📚 API Docs: http://{local_ip}:{port}/docs")
+    print(f"  🔄 Auto-reload: {'enabled' if reload else 'disabled'}")
+    print("="*70 + "\n")
+
     uvicorn.run(
         "src.api.server:app",
         host=host,
+        
+        
         port=port,
         reload=reload,
     )

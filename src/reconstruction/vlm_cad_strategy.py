@@ -1019,7 +1019,7 @@ class ModelManager:
 
                 model = AutoModelForCausalLM.from_pretrained(
                     hf_repo,
-                    torch_dtype=torch.float16 if device != "cpu" else torch.float32,
+                    dtype=torch.float16 if device != "cpu" else torch.float32,  # Changed from torch_dtype (deprecated)
                     trust_remote_code=True,
                     device_map="auto" if device == "cuda" else None,
                     low_cpu_mem_usage=True,
@@ -1050,7 +1050,7 @@ class ModelManager:
 
         model = AutoModel.from_pretrained(
             str(model_dir),
-            torch_dtype=torch.bfloat16 if device != "cpu" else torch.float32,
+            dtype=torch.bfloat16 if device != "cpu" else torch.float32,  # Changed from torch_dtype (deprecated)
             trust_remote_code=True,
             device_map=device if device == "cuda" else None,
         )

@@ -29,7 +29,80 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime
 import yaml
 
+# MPS (Metal Performance Shaders) stability settings for macOS
+# These help prevent crashes on newer macOS versions (26+/Tahoe)
+os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"  # Disable aggressive memory caching
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"  # Enable CPU fallback for unsupported MPS ops
+os.environ["MTL_DEBUG_LAYER"] = "0"  # Disable Metal debug validation layer
+os.environ["MTL_SHADER_VALIDATION"] = "0"  # Disable Metal shader validation
+
 logger = logging.getLogger(__name__)
+
+
+def check_mps_stability() -> bool:
+    """
+    Test if MPS (Metal Performance Shaders) is stable on this system.
+
+    Runs a small test computation to detect potential Metal heap allocator
+    crashes that occur on newer macOS versions (26+/Tahoe) with Python 3.13+.
+
+    Returns:
+        True if MPS is stable and can be used, False otherwise
+    """
+    try:
+        import torch
+    except ImportError:
+        return False
+
+    if not (hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()):
+        return False
+
+    # Check macOS version - MPS is unstable on macOS 26+ (Tahoe)
+    import platform
+    try:
+        macos_version = platform.mac_ver()[0]
+        major_version = int(macos_version.split('.')[0])
+        if major_version >= 26:
+            logger.warning(
+                f"macOS {macos_version} detected. MPS is unstable on macOS 26+. "
+                "Forcing CPU mode."
+            )
+            return False
+    except (ValueError, IndexError):
+        pass
+
+    try:
+        logger.info("Testing MPS stability...")
+
+        # Test basic operations that trigger the Metal heap allocator
+        device = torch.device("mps")
+        x = torch.randn(64, 64, device=device)
+        y = torch.randn(64, 64, device=device)
+        z = torch.matmul(x, y)
+
+        # Test linear layer (where crash typically occurs)
+        linear = torch.nn.Linear(64, 64).to(device)
+        output = linear(torch.randn(4, 64, device=device))
+
+        # Test memory management
+        torch.mps.synchronize()
+        torch.mps.empty_cache()
+
+        # Cleanup
+        del x, y, z, linear, output
+        torch.mps.empty_cache()
+
+        logger.info("MPS stability check passed")
+        return True
+
+    except Exception as e:
+        logger.warning(f"MPS stability check failed: {e}")
+        try:
+            import torch
+            torch.mps.empty_cache()
+        except Exception:
+            pass
+        return False
 
 
 @dataclass
@@ -60,7 +133,7 @@ class TrainingConfig:
     fp16: bool = True
     bf16: bool = False
     gradient_checkpointing: bool = True
-    dataloader_num_workers: int = 4
+    dataloader_num_workers: int = 0  # Disabled for MPS/CPU compatibility
     logging_steps: int = 10
     save_steps: int = 500
     eval_steps: int = 500
@@ -172,9 +245,15 @@ class FineTuner:
             if torch.cuda.is_available():
                 self.device = "cuda"
             elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-                self.device = "mps"
+                # MPS available but may be unstable on newer macOS versions (26+/Tahoe)
+                if check_mps_stability():
+                    self.device = "mps"
+                else:
+                    logger.warning("MPS available but unstable, using CPU instead")
+                    self.device = "cpu"
             else:
                 self.device = "cpu"
+            logger.info(f"Selected device: {self.device}")
         except ImportError:
             raise RuntimeError("PyTorch is required for fine-tuning")
 
@@ -286,7 +365,7 @@ class FineTuner:
         logger.info(f"Loading model: {self.config.base_model}")
         model = AutoModelForCausalLM.from_pretrained(
             self.config.base_model,
-            torch_dtype=torch.float16,
+            dtype=torch.float16,  # Changed from torch_dtype (deprecated)
             trust_remote_code=True,
         )
 
@@ -456,7 +535,7 @@ class FineTuner:
             # Load base model
             base_model = AutoModelForCausalLM.from_pretrained(
                 self.config.base_model,
-                torch_dtype=torch.float16,
+                dtype=torch.float16,  # Changed from torch_dtype (deprecated)
                 trust_remote_code=True,
             )
 
@@ -467,7 +546,7 @@ class FineTuner:
         else:
             model = AutoModelForCausalLM.from_pretrained(
                 checkpoint_path,
-                torch_dtype=torch.float16,
+                dtype=torch.float16,  # Changed from torch_dtype (deprecated)
                 trust_remote_code=True,
             )
 

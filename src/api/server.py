@@ -51,6 +51,15 @@ class JobCreate(BaseModel):
     options: Optional[dict] = None
 
 
+class TrainingMetrics(BaseModel):
+    """Training metrics for real-time display"""
+    epoch: Optional[int] = None
+    step: Optional[int] = None
+    total_steps: Optional[int] = None
+    loss: Optional[float] = None
+    learning_rate: Optional[float] = None
+
+
 class JobResponse(BaseModel):
     """Job status response"""
     job_id: str
@@ -61,6 +70,9 @@ class JobResponse(BaseModel):
     completed_at: Optional[datetime] = None
     error: Optional[str] = None
     output_files: list[str] = []
+    is_loading_model: bool = False  # True while downloading/loading model
+    loss: Optional[float] = None  # Latest training loss
+    metrics: Optional[TrainingMetrics] = None  # Detailed training metrics
 
 
 class PipelineProgress(BaseModel):
@@ -166,22 +178,82 @@ def create_app() -> FastAPI:
     @app.get("/jobs/{job_id}", response_model=JobResponse)
     async def get_job(job_id: str):
         """Get job status and progress"""
-        if job_id not in jobs:
-            raise HTTPException(status_code=404, detail="Job not found")
-        return JobResponse(**jobs[job_id])
+        # First check in-memory jobs (reconstruction jobs)
+        if job_id in jobs:
+            return JobResponse(**jobs[job_id])
+
+        # Check database for training jobs
+        from ..database import get_db, TrainingJob
+        try:
+            with get_db() as db:
+                training_job = db.query(TrainingJob).filter(TrainingJob.job_id == job_id).first()
+                if training_job:
+                    # Map training job status to JobStatus enum
+                    status_mapping = {
+                        "pending": JobStatus.PENDING,
+                        "running": JobStatus.PROCESSING,
+                        "completed": JobStatus.COMPLETED,
+                        "failed": JobStatus.FAILED
+                    }
+                    status = status_mapping.get(training_job.status, JobStatus.PENDING)
+
+                    # Build metrics object if we have training data
+                    metrics = None
+                    if training_job.current_loss is not None or training_job.current_epoch is not None:
+                        metrics = TrainingMetrics(
+                            epoch=training_job.current_epoch,
+                            step=training_job.current_step,
+                            total_steps=training_job.total_steps,
+                            loss=training_job.current_loss,
+                            learning_rate=training_job.learning_rate,
+                        )
+
+                    # Convert training job to JobResponse format
+                    return JobResponse(
+                        job_id=training_job.job_id,
+                        status=status,
+                        progress=training_job.progress or 0.0,
+                        current_stage=training_job.current_stage or "initializing",
+                        created_at=training_job.created_at,
+                        completed_at=training_job.completed_at,
+                        error=training_job.error_message,
+                        output_files=[],
+                        is_loading_model=training_job.is_loading_model or False,
+                        loss=training_job.current_loss,
+                        metrics=metrics,
+                    )
+        except Exception:
+            pass
+
+        raise HTTPException(status_code=404, detail="Job not found")
 
     @app.get("/jobs/{job_id}/progress", response_model=PipelineProgress)
     async def get_progress(job_id: str):
         """Get detailed pipeline progress"""
-        if job_id not in jobs:
-            raise HTTPException(status_code=404, detail="Job not found")
+        # First check in-memory jobs (reconstruction jobs)
+        if job_id in jobs:
+            job = jobs[job_id]
+            return PipelineProgress(
+                stage=job.get("current_stage") or "waiting",
+                progress=job["progress"],
+                message=f"Processing: {job.get('current_stage', 'queued')}"
+            )
 
-        job = jobs[job_id]
-        return PipelineProgress(
-            stage=job.get("current_stage") or "waiting",
-            progress=job["progress"],
-            message=f"Processing: {job.get('current_stage', 'queued')}"
-        )
+        # Check database for training jobs
+        from ..database import get_db, TrainingJob
+        try:
+            with get_db() as db:
+                training_job = db.query(TrainingJob).filter(TrainingJob.job_id == job_id).first()
+                if training_job:
+                    return PipelineProgress(
+                        stage=training_job.current_stage or "initializing",
+                        progress=training_job.progress or 0.0,
+                        message=f"Training: {training_job.current_stage or 'initializing'}"
+                    )
+        except Exception:
+            pass
+
+        raise HTTPException(status_code=404, detail="Job not found")
 
     @app.get("/jobs/{job_id}/download/{filename}")
     async def download_output(job_id: str, filename: str):
@@ -1163,37 +1235,31 @@ def create_app() -> FastAPI:
     @app.get("/training/datasets")
     async def list_datasets():
         """
-        List all training datasets.
+        List all training datasets from database (instant response).
 
         Returns:
             List of datasets with their statistics
         """
-        datasets_dir = Path("data/training")
-        datasets = []
+        from ..database import get_db, Dataset
 
-        if datasets_dir.exists():
-            for dataset_path in datasets_dir.iterdir():
-                if dataset_path.is_dir():
-                    stats_file = dataset_path / "dataset_stats.json"
-                    config_file = dataset_path / "config.json"
+        try:
+            with get_db() as db:
+                # Query all datasets, ordered by creation date (newest first)
+                datasets = db.query(Dataset).order_by(Dataset.created_at.desc()).all()
 
-                    dataset_info = {
-                        "name": dataset_path.name,
-                        "path": str(dataset_path),
-                        "created": datetime.fromtimestamp(dataset_path.stat().st_mtime).isoformat(),
-                    }
+                # Convert to dictionaries
+                dataset_list = [dataset.to_dict() for dataset in datasets]
 
-                    if stats_file.exists():
-                        import json
-                        with open(stats_file) as f:
-                            dataset_info["stats"] = json.load(f)
+                return {
+                    "datasets": dataset_list,
+                    "total": len(dataset_list),
+                }
 
-                    datasets.append(dataset_info)
-
-        return {
-            "datasets": datasets,
-            "total": len(datasets),
-        }
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to fetch datasets: {str(e)}"
+            )
 
     @app.post("/training/datasets/create")
     async def create_dataset(
@@ -1573,78 +1639,345 @@ def create_app() -> FastAPI:
     # Frontend-Compatible Training API Aliases & Extensions
     # =========================================================================
 
-    @app.post("/training/start")
-    async def start_training_alias(
-        background_tasks: BackgroundTasks,
-        dataset_id: str,
-        model_id: str = "openecad-0.89b",
-        config: Optional[Dict[str, Any]] = None,
-    ):
-        """
-        Start training (frontend-compatible endpoint).
+    class TrainingStartRequest(BaseModel):
+        """Request to start training"""
+        dataset_id: int
+        model_id: int
+        epochs: Optional[int] = 3
+        batch_size: Optional[int] = 32
+        learning_rate: Optional[float] = 1e-4
+        use_lora: Optional[bool] = True
+        device: Optional[str] = "auto"  # "auto", "mps", "cpu", "cuda"
 
-        Alias for /training/finetune/start with frontend-compatible parameters.
-        Maps simplified model IDs to full HuggingFace repo names.
+    @app.post("/training/start")
+    async def start_training_alias(request: TrainingStartRequest):
+        """
+        Start training with database-backed dataset and model selection.
 
         Args:
-            dataset_id: Dataset identifier (e.g., "openecad-10k")
-            model_id: Model identifier (e.g., "openecad-0.89b")
-            config: Training configuration {epochs, batch_size, learning_rate, lora_rank}
+            request: Training configuration with dataset_id and model_id from database
+
+        Returns:
+            Job information with job_id for tracking
         """
-        # Map frontend model IDs to full HuggingFace repo names
-        model_map = {
-            "openecad-0.55b": "Yuan-Che/OpenECADv2-CLIP-0.55B",
-            "openecad-0.89b": "Yuan-Che/OpenECADv2-SigLIP-0.89B",
-            "openecad-2.4b": "Yuan-Che/OpenECADv2-SigLIP-2.4B",
-            "openecad-3.1b": "Yuan-Che/OpenECAD-SigLIP-3.1B",
-            "internvl2-2b": "OpenGVLab/InternVL2-2B",
-            "internvl2-8b": "OpenGVLab/InternVL2-8B",
-        }
+        from ..database import get_db, Dataset, Model, TrainingJob
+        import uuid
 
-        base_model = model_map.get(model_id, model_id)
+        # Log the received request
+        print(f"Training request received: {request.model_dump_json(indent=2)}")
 
-        # Extract config parameters
-        cfg = config or {}
-        epochs = cfg.get("epochs", 3)
-        batch_size = cfg.get("batch_size", 2)
-        learning_rate = cfg.get("learning_rate", 1e-4)
-        lora_rank = cfg.get("lora_rank", 128)
+        try:
+            with get_db() as db:
+                # Verify dataset exists
+                dataset = db.query(Dataset).filter(Dataset.id == request.dataset_id).first()
+                if not dataset:
+                    raise HTTPException(status_code=404, detail=f"Dataset {request.dataset_id} not found")
 
-        # Call the existing finetune endpoint
-        return await start_finetuning(
-            background_tasks=background_tasks,
-            dataset_name=dataset_id,
-            base_model=base_model,
-            epochs=epochs,
-            batch_size=batch_size,
-            learning_rate=learning_rate,
-            lora_rank=lora_rank,
-        )
+                # Verify model exists
+                model = db.query(Model).filter(Model.id == request.model_id).first()
+                if not model:
+                    raise HTTPException(status_code=404, detail=f"Model {request.model_id} not found")
+
+                # Create training job in database
+                job_id = str(uuid.uuid4())
+                training_job = TrainingJob(
+                    job_id=job_id,
+                    dataset_id=request.dataset_id,
+                    model_id=request.model_id,
+                    epochs=request.epochs,
+                    batch_size=request.batch_size,
+                    learning_rate=request.learning_rate,
+                    use_lora=request.use_lora,
+                    device=request.device,
+                    status="pending",
+                    progress=0.0,
+                    current_stage="Initializing",
+                )
+                db.add(training_job)
+                db.flush()
+
+                # Return job info
+                return {
+                    "job_id": job_id,
+                    "status": "pending",
+                    "message": f"Training job created: {model.display_name} on {dataset.name}",
+                    "dataset": dataset.name,
+                    "model": model.display_name,
+                    "config": {
+                        "epochs": request.epochs,
+                        "batch_size": request.batch_size,
+                        "learning_rate": request.learning_rate,
+                        "use_lora": request.use_lora,
+                        "device": request.device,
+                    }
+                }
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to start training: {str(e)}")
+
+    @app.get("/training/{job_id}/status")
+    async def get_training_status(job_id: str):
+        """
+        Get status of a training job by job_id.
+
+        Args:
+            job_id: The unique job identifier returned from /training/start
+
+        Returns:
+            Job status with progress, current stage, and completion info
+        """
+        from ..database import get_db, TrainingJob
+
+        try:
+            with get_db() as db:
+                job = db.query(TrainingJob).filter(TrainingJob.job_id == job_id).first()
+
+                if not job:
+                    raise HTTPException(status_code=404, detail=f"Training job {job_id} not found")
+
+                return job.to_dict()
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to get job status: {str(e)}")
+
+    @app.post("/training/jobs/{job_id}/stop")
+    async def stop_training_job(job_id: str):
+        """
+        Stop a running training job.
+
+        Args:
+            job_id: The training job ID
+
+        Returns:
+            Job status after stopping
+        """
+        from ..database import get_db, TrainingJob
+
+        try:
+            with get_db() as db:
+                job = db.query(TrainingJob).filter(TrainingJob.job_id == job_id).first()
+
+                if not job:
+                    raise HTTPException(status_code=404, detail=f"Training job {job_id} not found")
+
+                if job.status == "completed":
+                    return {
+                        "message": "Job already completed",
+                        "job_id": job_id,
+                        "status": job.status
+                    }
+
+                if job.status == "failed":
+                    return {
+                        "message": "Job already failed",
+                        "job_id": job_id,
+                        "status": job.status
+                    }
+
+                # Mark job as failed (stop request)
+                job.status = "failed"
+                job.error_message = "Stopped by user request"
+                job.completed_at = datetime.utcnow()
+                db.commit()
+
+                return {
+                    "message": "Training job stopped",
+                    "job_id": job_id,
+                    "status": "failed"
+                }
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to stop job: {str(e)}")
+
+    @app.get("/training/jobs/{job_id}/download")
+    async def get_download_progress(job_id: str):
+        """
+        Get model download progress for a training job.
+
+        Returns detailed download information including:
+        - Download percentage
+        - Downloaded size vs total size
+        - Download speed
+        - ETA
+        - Files complete/total
+
+        Args:
+            job_id: The training job ID
+
+        Returns:
+            Download progress information or 404 if not downloading
+        """
+        from ..database import get_db, TrainingJob, Model
+        from ..training.download_tracker import get_download_tracker
+
+        try:
+            with get_db() as db:
+                job = db.query(TrainingJob).filter(TrainingJob.job_id == job_id).first()
+
+                if not job:
+                    raise HTTPException(status_code=404, detail=f"Training job {job_id} not found")
+
+                # Get model info
+                model = db.query(Model).filter(Model.id == job.model_id).first()
+                if not model:
+                    raise HTTPException(status_code=404, detail="Model not found")
+
+                # Get download progress
+                tracker = get_download_tracker()
+                progress = tracker.to_dict(model.huggingface_id)
+
+                if not progress:
+                    # Not downloading - either complete or hasn't started
+                    return {
+                        "job_id": job_id,
+                        "is_downloading": False,
+                        "message": "Model already downloaded or download not started"
+                    }
+
+                return {
+                    "job_id": job_id,
+                    **progress
+                }
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to get download progress: {str(e)}")
 
     @app.get("/training/jobs")
     async def list_training_jobs(limit: int = 50):
         """
-        List training jobs (frontend-compatible endpoint).
+        List training jobs from database and in-memory jobs.
 
-        Returns only jobs with job_type='finetune', 'dataset_creation', or 'batch_training'.
+        Returns all training jobs including VLM fine-tuning jobs from database
+        and legacy training jobs from in-memory storage.
         """
-        training_job_types = {"finetune", "dataset_creation", "batch_training"}
+        from ..database import get_db, TrainingJob, TrainingResult
 
-        training_jobs = [
-            job for job in jobs.values()
+        all_jobs = []
+
+        # Get training jobs from database
+        try:
+            with get_db() as db:
+                db_jobs = db.query(TrainingJob).order_by(
+                    TrainingJob.created_at.desc()
+                ).limit(limit).all()
+
+                # Map training job status to JobStatus enum
+                status_mapping = {
+                    "pending": JobStatus.PENDING,
+                    "running": JobStatus.PROCESSING,
+                    "completed": JobStatus.COMPLETED,
+                    "failed": JobStatus.FAILED
+                }
+
+                for tj in db_jobs:
+                    status = status_mapping.get(tj.status, JobStatus.PENDING)
+
+                    # Get loss - prefer current_loss (real-time), fallback to TrainingResult
+                    loss_value = tj.current_loss
+                    if loss_value is None:
+                        latest_result = db.query(TrainingResult).filter(
+                            TrainingResult.job_id == tj.id
+                        ).order_by(TrainingResult.id.desc()).first()
+                        if latest_result and latest_result.train_loss is not None:
+                            loss_value = latest_result.train_loss
+
+                    # Build metrics object if we have training data
+                    metrics = None
+                    if tj.current_loss is not None or tj.current_epoch is not None:
+                        metrics = TrainingMetrics(
+                            epoch=tj.current_epoch,
+                            step=tj.current_step,
+                            total_steps=tj.total_steps,
+                            loss=tj.current_loss,
+                            learning_rate=tj.learning_rate,
+                        )
+
+                    all_jobs.append(JobResponse(
+                        job_id=tj.job_id,
+                        status=status,
+                        progress=tj.progress or 0.0,
+                        current_stage=tj.current_stage or "initializing",
+                        created_at=tj.created_at,
+                        completed_at=tj.completed_at,
+                        error=tj.error_message,
+                        output_files=[],
+                        is_loading_model=tj.is_loading_model or False,
+                        loss=loss_value,
+                        metrics=metrics,
+                    ))
+        except Exception:
+            pass
+
+        # Also include in-memory training jobs (legacy)
+        training_job_types = {"finetune", "dataset_creation", "batch_training"}
+        memory_jobs = [
+            JobResponse(**job) for job in jobs.values()
             if job.get("job_type") in training_job_types
         ]
 
+        all_jobs.extend(memory_jobs)
+
+        # Sort by created_at and limit
         sorted_jobs = sorted(
-            training_jobs,
-            key=lambda j: j["created_at"],
+            all_jobs,
+            key=lambda j: j.created_at,
             reverse=True
         )[:limit]
 
         return {
-            "jobs": [JobResponse(**j) for j in sorted_jobs],
+            "jobs": sorted_jobs,
             "total": len(sorted_jobs),
         }
+
+    @app.get("/training/models/available")
+    async def list_available_models():
+        """
+        List available VLM models that can be used for training.
+
+        Returns models from the database with their specifications,
+        including whether they are already downloaded locally.
+        """
+        from ..database import get_db, Model
+        from ..training import is_model_cached, get_model_cache_info
+
+        try:
+            with get_db() as db:
+                # Query all available models
+                models = db.query(Model).filter(Model.available == True).order_by(
+                    Model.recommended_for_cad.desc(),
+                    Model.min_vram_gb.asc()
+                ).all()
+
+                # Convert to dictionaries and add cache status
+                model_list = []
+                for model in models:
+                    model_dict = model.to_dict()
+
+                    # Add download status
+                    cache_info = get_model_cache_info(model.huggingface_id)
+                    model_dict["is_downloaded"] = cache_info["is_cached"]
+                    model_dict["cache_size_bytes"] = cache_info["cache_size_bytes"]
+
+                    model_list.append(model_dict)
+
+                return {
+                    "models": model_list,
+                    "total": len(model_list),
+                }
+
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to fetch available models: {str(e)}"
+            )
 
     @app.get("/training/models")
     async def list_trained_models():
@@ -2004,6 +2337,103 @@ def create_app() -> FastAPI:
 
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
+
+    # Training worker instance
+    training_worker = None
+
+    @app.on_event("startup")
+    async def startup_event():
+        """Initialize database, start training worker, and log when FastAPI application is ready"""
+        import logging
+        import socket
+        import os
+        from ..database import init_db
+        from ..training import TrainingWorker
+
+        nonlocal training_worker
+
+        logger = logging.getLogger("uvicorn.error")
+
+        # Get local IP address
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+            s.close()
+        except Exception:
+            local_ip = "127.0.0.1"
+
+        # Get port from environment or default
+        port = int(os.getenv("PORT", "7001"))
+
+        # Set MPS memory management environment variables
+        os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
+        os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+        os.environ["MPS_MEMORY_GROWTH_INCREMENT"] = "0.2"
+        os.environ["MTL_DEBUG_LAYER"] = "0"  # Disable Metal debug validation
+
+        # Get PyTorch version early (triggers Metal API message before banner)
+        try:
+            import torch
+            pytorch_version = torch.__version__
+            mps_status = "enabled" if torch.backends.mps.is_available() else "disabled"
+        except Exception:
+            pytorch_version = "unknown"
+            mps_status = "unknown"
+
+        # Print startup banner
+        logger.info("=" * 70)
+        logger.info("  3D Reconstruction Backend Server")
+        logger.info("=" * 70)
+        logger.info(f"  Host:    0.0.0.0 (listening on all interfaces)")
+        logger.info(f"  Port:    {port}")
+        logger.info(f"  URL:     http://{local_ip}:{port}")
+        logger.info(f"  Docs:    http://{local_ip}:{port}/docs")
+        logger.info(f"  PyTorch: {pytorch_version} (MPS: {mps_status})")
+        logger.info("=" * 70)
+
+        # Initialize database
+        try:
+            init_db()
+            logger.info("💾 Database initialized successfully")
+        except Exception as e:
+            logger.error(f"❌ Database initialization failed: {e}")
+
+        # Reset any stale running jobs (from previous server crash/restart)
+        try:
+            from ..database import reset_stale_jobs
+            stale_count = reset_stale_jobs()
+            if stale_count > 0:
+                logger.warning(f"⚠️  Reset {stale_count} stale job(s) to 'halted' status")
+        except Exception as e:
+            logger.error(f"❌ Failed to reset stale jobs: {e}")
+
+        # Start training worker
+        try:
+            training_worker = TrainingWorker(check_interval=5)
+            training_worker.start()
+            logger.info("🤖 Training worker started successfully")
+        except Exception as e:
+            logger.error(f"❌ Training worker failed to start: {e}")
+
+        logger.info("✅ FastAPI application is ready and accepting requests")
+
+    @app.on_event("shutdown")
+    async def shutdown_event():
+        """Cleanup on server shutdown"""
+        import logging
+
+        nonlocal training_worker
+
+        logger = logging.getLogger("uvicorn.error")
+
+        # Stop training worker
+        if training_worker:
+            try:
+                training_worker.stop()
+                logger.info("🤖 Training worker stopped")
+            except Exception as e:
+                logger.error(f"❌ Failed to stop training worker: {e}")
 
     return app
 
